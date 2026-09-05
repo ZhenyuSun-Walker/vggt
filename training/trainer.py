@@ -91,6 +91,8 @@ class Trainer:
     ):
         self._setup_env_variables(env_variables)
         self._setup_timers()
+        self.meters = None
+        self.est_epoch_time = {}
 
         self.data_conf = data
         self.model_conf = model
@@ -221,7 +223,16 @@ class Trainer:
             
         logging.info(f"Loading the optimizer state dict (rank {self.rank})")
         if "optimizer" in checkpoint:
-            self.optims.optimizer.load_state_dict(checkpoint["optimizer"])
+            optimizer_states = checkpoint["optimizer"]
+            if not isinstance(optimizer_states, list):
+                optimizer_states = [optimizer_states]
+            if len(optimizer_states) != len(self.optims):
+                raise ValueError(
+                    f"Checkpoint has {len(optimizer_states)} optimizer states, "
+                    f"but this trainer has {len(self.optims)} optimizers."
+                )
+            for optim, optimizer_state in zip(self.optims, optimizer_states):
+                optim.optimizer.load_state_dict(optimizer_state)
 
         if "epoch" in checkpoint:
             self.epoch = checkpoint["epoch"]
@@ -526,7 +537,7 @@ class Trainer:
         )
 
         for data_iter, batch in enumerate(val_loader):
-            if data_iter > limit_val_batches:
+            if data_iter >= limit_val_batches:
                 break
 
             # measure data loading time
@@ -534,10 +545,9 @@ class Trainer:
             data_times.append(data_time.val)
 
             with torch.cuda.amp.autocast(enabled=False):
-                batch = self._process_batch(batch, 'val', local_data_ids)
+                batch = self._process_batch(batch, phase="val")
             batch = copy_data_to_device(batch, self.device)
 
-            import pdb; pdb.set_trace()
             # compute output
             with torch.no_grad():
                 with torch.cuda.amp.autocast(
@@ -546,11 +556,14 @@ class Trainer:
                 ):
                     for phase, model in zip(curr_phases, curr_models):
                         with self._to_full_val_model(model):
-                            self._step(
+                            loss_dict = self._step(
                                 batch,
                                 model,
                                 phase,
                                 loss_meters,
+                            )
+                            loss_meters[f"Loss/{phase}_objective"].update(
+                                loss_dict["objective"].item(), batch["images"].shape[0]
                             )
 
             # measure elapsed time
@@ -567,9 +580,6 @@ class Trainer:
             if data_iter % self.logging_conf.log_freq == 0:
                 progress.display(data_iter)
 
-        self.est_epoch_time['val'] = batch_time.avg * iters_per_epoch
-        self._log_sync_data_times('val', data_times)
-
         for model in curr_models:
             with self._to_full_val_model(model):
                 if hasattr(
@@ -577,15 +587,12 @@ class Trainer:
                 ):
                     unwrap_ddp_or_fsdp_if_wrapped(model).on_validation_epoch_end()
 
-        out_dict = self._log_meters_and_save_best_ckpts(curr_phases)
-
-        for phase in curr_phases:
-            out_dict.update(self._get_trainer_state(phase))
+        self.est_epoch_time['val'] = batch_time.avg * iters_per_epoch
+        out_dict = self._get_trainer_state("val")
 
         for k, v in loss_meters.items():
             out_dict[k] = v.avg
 
-        self._reset_meters(curr_phases)
         logging.info(f"Meters: {out_dict}")
         return out_dict
 
@@ -653,7 +660,7 @@ class Trainer:
             self.gradient_clipper.setup_clipping(self.model)
 
         for data_iter, batch in enumerate(train_loader):
-            if data_iter > limit_train_batches:
+            if data_iter >= limit_train_batches:
                 break
             
             # measure data loading time
@@ -809,16 +816,17 @@ class Trainer:
     def _apply_batch_repetition(self, batch: Mapping) -> Mapping:
         tensor_keys = [
             "images", "depths", "extrinsics", "intrinsics", 
-            "cam_points", "world_points", "point_masks", 
+            "cam_points", "world_points", "point_masks", "is_top_down",
+            "td_num_views", "reference_frame_idx",
         ]        
         string_keys = ["seq_name"]
         
         for key in tensor_keys:
             if key in batch:
                 original_tensor = batch[key]
-                batch[key] = torch.concatenate([original_tensor, 
-                                                torch.flip(original_tensor, dims=[1])], 
-                                                dim=0)
+                # Do not reverse the view axis: MV[0] must remain the reference
+                # and TD must remain the final unregistered conditioning view.
+                batch[key] = torch.concatenate([original_tensor, original_tensor], dim=0)
         
         for key in string_keys:
             if key in batch:
@@ -827,8 +835,8 @@ class Trainer:
         return batch
 
 
-    def _process_batch(self, batch: Mapping):      
-        if self.data_conf.train.common_config.repeat_batch:
+    def _process_batch(self, batch: Mapping, phase: str = "train"):
+        if phase == "train" and self.data_conf.train.common_config.repeat_batch:
             batch = self._apply_batch_repetition(batch)
         
         # Normalize camera extrinsics and points. The function returns new tensors.
@@ -859,7 +867,12 @@ class Trainer:
         loss_meters: dict[str, AverageMeter],
     ):
         # Forward run of the model
-        y_hat = model(images = batch["images"])
+        td_num_views = batch.get("td_num_views", 0)
+        if torch.is_tensor(td_num_views):
+            if td_num_views.numel() and not torch.all(td_num_views == td_num_views.flatten()[0]):
+                raise ValueError("Every sample in a DDP batch must use the same TD view count.")
+            td_num_views = int(td_num_views.flatten()[0].item()) if td_num_views.numel() else 0
+        y_hat = model(images=batch["images"], td_num_views=td_num_views)
         # Compute the loss
         loss_dict = self.loss(y_hat, batch)
         
@@ -979,4 +992,3 @@ def get_chunk_from_data(data, chunk_id, num_chunks):
         return [get_chunk_from_data(value, chunk_id, num_chunks) for value in data]
     else:
         return data
-

@@ -148,6 +148,12 @@ class ComposedDataset(Dataset, ABC):
             "point_masks": point_masks,
         }
 
+        # TD images are appended after all perspective frames.  Keep the
+        # modality boundary for the model and retain the explicit reference.
+        for key in ("is_top_down", "td_num_views", "reference_frame_idx"):
+            if key in batch:
+                sample[key] = torch.from_numpy(batch[key]) if isinstance(batch[key], np.ndarray) else batch[key]
+
         # --- Track Processing (if enabled) ---
         if self.load_track:
             if batch["tracks"] is not None:

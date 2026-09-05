@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import functools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,6 +69,8 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        separate_td_global_qkv=True,
+        separate_td_global_ffn=True,
     ):
         super().__init__()
 
@@ -89,6 +92,8 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    # Frame attention is always intra-view; TD/MV separation is
+                    # only required in global layers where the modalities meet.
                 )
                 for _ in range(depth)
             ]
@@ -106,6 +111,8 @@ class Aggregator(nn.Module):
                     init_values=init_values,
                     qk_norm=qk_norm,
                     rope=self.rope,
+                    separate_td_qkv=separate_td_global_qkv,
+                    separate_td_ffn=separate_td_global_ffn,
                 )
                 for _ in range(depth)
             ]
@@ -181,7 +188,7 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor) -> Tuple[List[torch.Tensor], int]:
+    def forward(self, images: torch.Tensor, td_num_views: int = 0) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
@@ -193,6 +200,11 @@ class Aggregator(nn.Module):
                 and the patch_start_idx indicating where patch tokens begin.
         """
         B, S, C_in, H, W = images.shape
+        if not 0 <= td_num_views < S:
+            raise ValueError(
+                f"td_num_views must be in [0, {S - 1}] so a perspective reference exists; "
+                f"got {td_num_views}."
+            )
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
@@ -242,7 +254,7 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, td_num_views=td_num_views
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -281,7 +293,7 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, td_num_views=0):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -292,13 +304,24 @@ class Aggregator(nn.Module):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
 
         intermediates = []
+        # Views are packed as [MV (reference frame first), TD].  Each view owns
+        # P tokens, therefore this is the modality boundary in flattened global
+        # attention.  TD remains unregistered: it only participates as context.
+        td_token_start = (S - td_num_views) * P if td_num_views else None
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
-                tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
+                tokens = checkpoint(
+                    functools.partial(self.global_blocks[global_idx], td_token_start=td_token_start),
+                    tokens,
+                    pos,
+                    use_reentrant=self.use_reentrant,
+                )
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens = self.global_blocks[global_idx](
+                    tokens, pos=pos, td_token_start=td_token_start
+                )
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

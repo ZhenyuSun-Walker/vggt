@@ -9,6 +9,7 @@ from typing import Callable, Optional
 from hydra.utils import instantiate
 import random
 import numpy as np
+import math
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, IterableDataset, Sampler
 from abc import ABC, abstractmethod
 
@@ -68,7 +69,9 @@ class DynamicTorchDataset(ABC):
         print("Building dynamic dataloader with seed:", self.seed)
 
         # Set the epoch for the sampler
-        self.sampler.set_epoch(epoch)
+        # Every rank must draw identical dynamic batch shapes; otherwise one DDP
+        # process can finish its epoch earlier and hang at gradient all-reduce.
+        self.batch_sampler.set_epoch(epoch + self.seed)
         if hasattr(self.dataset, "epoch"):
             self.dataset.epoch = epoch
         if hasattr(self.dataset, "set_epoch"):
@@ -118,6 +121,7 @@ class DynamicBatchSampler(Sampler):
         self.aspect_ratio_range = aspect_ratio_range
         self.image_num_range = image_num_range
         self.rng = random.Random()
+        self.np_rng = np.random.default_rng()
 
         # Uniformly sample from the range of possible image numbers
         # For any image number, the weight is 1.0 (uniform sampling). You can set any different weights here.
@@ -147,6 +151,7 @@ class DynamicBatchSampler(Sampler):
         self.sampler.set_epoch(epoch)
         self.epoch = epoch
         self.rng.seed(epoch * 100)
+        self.np_rng = np.random.default_rng(epoch * 100)
 
     def __iter__(self):
         """
@@ -160,7 +165,7 @@ class DynamicBatchSampler(Sampler):
         while True:
             try:
                 # Sample random image number and aspect ratio
-                random_image_num = int(np.random.choice(self.possible_nums, p=self.normalized_weights))
+                random_image_num = int(self.np_rng.choice(self.possible_nums, p=self.normalized_weights))
                 random_aspect_ratio = round(self.rng.uniform(self.aspect_ratio_range[0], self.aspect_ratio_range[1]), 2)
 
                 # Update sampler parameters
@@ -192,8 +197,13 @@ class DynamicBatchSampler(Sampler):
                 break  # End of sampler's iterator
 
     def __len__(self):
-        # Return a large dummy length
-        return 1000000
+        # The production TD/MV config fixes the number of MV images, so this is
+        # exact and keeps schedule progress/ETA correct.  For variable-length
+        # legacy configs, each yielded batch contains at least one sample.
+        if len(self.possible_nums) == 1:
+            batch_size = max(1, self.max_img_per_gpu // int(self.possible_nums[0]))
+            return math.ceil(len(self.sampler) / batch_size)
+        return len(self.sampler)
 
 
 class DynamicDistributedSampler(DistributedSampler):

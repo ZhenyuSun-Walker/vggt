@@ -1,0 +1,142 @@
+defaults:
+  - default
+  - _self_
+
+# Eight 80-GB A100s: one sequence (4 perspective frames + 1 TD condition) per
+# rank, accumulated for eight steps. Increase max_img_per_gpu only after a
+# memory-profiled warm-up on the target A100 SKU.
+exp_name: td_hm3d_fpstru3d_8a100
+img_size: 518
+num_workers: 8
+accum_steps: 8
+limit_train_batches: null
+limit_val_batches: null
+
+data:
+  train:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    shuffle: true
+    pin_memory: true
+    persistent_workers: true
+    max_img_per_gpu: 4
+    common_config:
+      fix_img_num: 4
+      fix_aspect_ratio: 1.0
+      load_track: false
+      track_num: 0
+      training: true
+      inside_random: false
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      rescale: true
+      rescale_aug: true
+      landscape_check: false
+      debug: false
+      get_nearby: false
+      load_depth: true
+      img_nums: [4, 4]
+      allow_duplicate_img: true
+      repeat_batch: false
+      augs:
+        cojitter: true
+        cojitter_ratio: 0.3
+        scales: [0.8, 1.0]
+        aspects: [1.0, 1.0]
+        color_jitter: {brightness: 0.3, contrast: 0.3, saturation: 0.3, hue: 0.05, p: 0.8}
+        gray_scale: false
+        gau_blur: false
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.td_fusion.TopDownFusionDataset
+          data_root: data/TD_HM3D
+          dataset_kind: td_hm3d
+          split: train
+        - _target_: data.datasets.td_fusion.TopDownFusionDataset
+          data_root: data/FP_Stru3D
+          dataset_kind: fp_stru3d
+          split: train
+  val:
+    _target_: data.dynamic_dataloader.DynamicTorchDataset
+    num_workers: ${num_workers}
+    shuffle: false
+    pin_memory: true
+    persistent_workers: true
+    max_img_per_gpu: 4
+    common_config:
+      fix_img_num: 4
+      fix_aspect_ratio: 1.0
+      load_track: false
+      track_num: 0
+      training: false
+      inside_random: false
+      img_size: ${img_size}
+      patch_size: ${patch_size}
+      rescale: true
+      rescale_aug: false
+      landscape_check: false
+      debug: false
+      get_nearby: false
+      load_depth: true
+      img_nums: [4, 4]
+      allow_duplicate_img: true
+      repeat_batch: false
+      augs:
+        cojitter: false
+        cojitter_ratio: 1.0
+        scales: null
+        aspects: [1.0, 1.0]
+        color_jitter: null
+        gray_scale: false
+        gau_blur: false
+    dataset:
+      _target_: data.composed_dataset.ComposedDataset
+      dataset_configs:
+        - _target_: data.datasets.td_fusion.TopDownFusionDataset
+          data_root: data/TD_HM3D
+          dataset_kind: td_hm3d
+          split: val
+        - _target_: data.datasets.td_fusion.TopDownFusionDataset
+          data_root: data/FP_Stru3D
+          dataset_kind: fp_stru3d
+          split: val
+
+logging:
+  log_dir: logs/${exp_name}
+  log_freq: 20
+
+checkpoint:
+  save_dir: logs/${exp_name}/ckpts
+  resume_checkpoint_path: null
+  strict: false
+
+model:
+  _target_: vggt.models.vggt.VGGT
+  img_size: ${img_size}
+  patch_size: ${patch_size}
+  enable_camera: true
+  enable_depth: true
+  enable_point: false
+  enable_track: false
+  separate_td_global_qkv: true
+  separate_td_global_ffn: true
+
+optim:
+  frozen_module_names: null
+  optimizer:
+    _target_: torch.optim.AdamW
+    lr: 0.0001
+    weight_decay: 0.05
+  amp:
+    enabled: true
+    amp_dtype: bfloat16
+
+cuda:
+  cudnn_deterministic: false
+  cudnn_benchmark: true
+  allow_tf32: true
+
+hydra:
+  job:
+    chdir: false

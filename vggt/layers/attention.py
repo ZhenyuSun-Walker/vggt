@@ -11,6 +11,7 @@ import logging
 import os
 import warnings
 
+import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -31,6 +32,7 @@ class Attention(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        separate_td_qkv: bool = False,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, "dim should be divisible by num_heads"
@@ -40,6 +42,13 @@ class Attention(nn.Module):
         self.fused_attn = fused_attn
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # Global attention receives all MV tokens followed by all TD tokens.  A
+        # duplicate projection lets the model learn modality-specific Q/K/V
+        # features while preserving cross-modal attention connectivity.
+        self.separate_td_qkv = separate_td_qkv
+        if separate_td_qkv:
+            self.qkv_td = nn.Linear(dim, dim * 3, bias=qkv_bias)
+            self.qkv_td.load_state_dict(self.qkv.state_dict())
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
@@ -47,9 +56,24 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def _project_qkv(self, x: Tensor, td_token_start: int | None) -> Tensor:
+        if td_token_start is None or not self.separate_td_qkv:
+            return self.qkv(x)
+        if not 0 <= td_token_start <= x.shape[1]:
+            raise ValueError(
+                f"td_token_start must be in [0, {x.shape[1]}], got {td_token_start}."
+            )
+        if td_token_start == 0:
+            return self.qkv_td(x)
+        if td_token_start == x.shape[1]:
+            return self.qkv(x)
+        return torch.cat(
+            (self.qkv(x[:, :td_token_start]), self.qkv_td(x[:, td_token_start:])), dim=1
+        )
+
+    def forward(self, x: Tensor, pos=None, td_token_start: int | None = None) -> Tensor:
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = self._project_qkv(x, td_token_start).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 

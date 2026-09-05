@@ -1,12 +1,20 @@
-from hydra import initialize, compose
-from omegaconf import DictConfig, OmegaConf
+"""Hydra entrypoint used by torchrun for DDP training."""
+
+from pathlib import Path
+import sys
+
+import hydra
+from omegaconf import DictConfig
+
+# ``torchrun training/launch.py`` imports sibling training modules directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trainer import Trainer
 
 
-with initialize(version_base=None, config_path="config"):
-    cfg = compose(config_name="default")      # loads default.yaml
+@hydra.main(version_base=None, config_path="config", config_name="td_fusion_8a100")
+def main(cfg: DictConfig) -> None:
+    Trainer(**cfg).run()
 
-trainer = Trainer(**cfg)
-trainer.run()
-import pdb;pdb.set_trace()
-m=1
+
+if __name__ == "__main__":
+    main()

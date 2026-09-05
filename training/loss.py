@@ -91,10 +91,11 @@ def compute_camera_loss(
 ):
     # List of predicted pose encodings per stage
     pred_pose_encodings = pred_dict['pose_enc_list']
-    # Binary mask for valid points per frame (B, N, H, W)
+    # TD is an unregistered condition and cannot receive a camera target.
     point_masks = batch_data['point_masks']
-    # Only consider frames with enough valid points (>100)
-    valid_frame_mask = point_masks[:, 0].sum(dim=[-1, -2]) > 100
+    valid_frame_mask = point_masks.sum(dim=[-1, -2]) > 100
+    if "is_top_down" in batch_data:
+        valid_frame_mask = valid_frame_mask & ~batch_data["is_top_down"].bool()
     # Number of prediction stages
     n_stages = len(pred_pose_encodings)
 
@@ -805,5 +806,4 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
 
     return flow_loss
 '''
-
 

@@ -44,6 +44,8 @@ class Block(nn.Module):
         qk_norm: bool = False,
         fused_attn: bool = True,  # use F.scaled_dot_product_attention or not
         rope=None,
+        separate_td_qkv: bool = False,
+        separate_td_ffn: bool = False,
     ) -> None:
         super().__init__()
 
@@ -59,6 +61,7 @@ class Block(nn.Module):
             qk_norm=qk_norm,
             fused_attn=fused_attn,
             rope=rope,
+            separate_td_qkv=separate_td_qkv,
         )
 
         self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
@@ -69,17 +72,34 @@ class Block(nn.Module):
         self.mlp = ffn_layer(
             in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, bias=ffn_bias
         )
+        self.separate_td_ffn = separate_td_ffn
+        if separate_td_ffn:
+            self.mlp_td = ffn_layer(
+                in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop, bias=ffn_bias
+            )
+            self.mlp_td.load_state_dict(self.mlp.state_dict())
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, td_token_start: int | None = None) -> Tensor:
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos))
+            return self.ls1(self.attn(self.norm1(x), pos=pos, td_token_start=td_token_start))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
-            return self.ls2(self.mlp(self.norm2(x)))
+            x = self.norm2(x)
+            if td_token_start is None or not self.separate_td_ffn:
+                return self.ls2(self.mlp(x))
+            if not 0 <= td_token_start <= x.shape[1]:
+                raise ValueError(
+                    f"td_token_start must be in [0, {x.shape[1]}], got {td_token_start}."
+                )
+            if td_token_start == 0:
+                return self.ls2(self.mlp_td(x))
+            if td_token_start == x.shape[1]:
+                return self.ls2(self.mlp(x))
+            return self.ls2(torch.cat((self.mlp(x[:, :td_token_start]), self.mlp_td(x[:, td_token_start:])), dim=1))
 
         if self.training and self.sample_drop_ratio > 0.1:
             # the overhead is compensated only for a drop path rate larger than 0.1
